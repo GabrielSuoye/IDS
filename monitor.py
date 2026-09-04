@@ -1,15 +1,48 @@
 import asyncio
 import time
+import os 
 from collections import defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor
 from typing import Dict, Any
-from scapy.all import AsyncSniffer, IP, TCP, Ether
+from scapy.all import AsyncSniffer, IP, TCP
 
+
+import joblib
+import numpy as np 
+import xgboost as xgb 
+import torch 
+import torch.nn as nn 
+
+# Global Models inside Worker Process 
+xgb_model = None
+autoencoder_model = None
+AE_THRESHOLD = 15.0    # Reconstruction error threshold for zero-days
+
+# PyTorch Autoencoder Structure 
+class PacketAutoencoder(nn.Module):
+    def __init__(self):
+        super(PacketAutoencoder, self).__init__()
+        # Compress 3 features down to 1 bottleneck layer, then rebuild them.
+        self.encoder = nn.Sequential(nn.Linear(3, 2), nn.ReLU(), nn.Linear(2, 1))
+        self.decoder = nn.Sequential(nn.Linear(1, 2), nn.ReLU(), nn.Linear(2, 3))
+
+    def forward(self, x):
+        return self.decoder(self.encoder(x))
 
 def initialize_worker():
-    """Initialize ML model here so it doesn't reload on every single packet."""
-    global my_ml_model
-    my_ml_model = None  # Change to ML model.
+    """Runs ONCE per CPU core to load both models into memory."""
+    global xgb_model, autoencoder_model
+
+    # 1. Load Tier 2: XGBoost
+    if os.path.exists(xgb_path):
+        xgb_model = joblib.load(xgb_path)
+        print(f"[*] Core {os.getpid()}: Tier 2 XGBoost loaded.")
+
+    # 2. Load Tier 3: PyTorch Autoencoder
+    # In Production, load a trained weight file using torch.load()
+    autoencoder_model = PacketAutoencoder()
+    autoencoder_model.eval() # Set to inference mode.
+    print(f"[*] Core {os.getpid()}: Tier 3 Autoencoder initialized.")
 
 
 """OLD Logic"""
@@ -46,24 +79,51 @@ def initialize_worker():
 
 def process_anomaly_inference(window_features):
     """
-    CPU-BOUND WORK: This executes on isolated CPU cores.
-    Receives pre-computed window metrics from the main thread.
+    TIER 2 & 3 ENGINES: Runs on completely isolated CPU cores.
+    Performs a conditional cascade fallback.
     """
-    # Anomaly Inference Engine
+    global xgb_model, autoencoder_model
     # Unpack the metrics prepared by the sliding window
-    pps = window_features["packets_per_sec"]
-    unique_dsts = window_features["unique_dst_ips"]
-    avg_len = window_features["avg_packet_len"]
+    try:
+        pps = window_features["packets_per_sec"]
+        unique_dsts = window_features["unique_dst_ips"]
+        avg_len = window_features["avg_packet_len"]
+        feature_vector = np.array([pps, unique_dsts, avg_len], dtype=np.float32)
 
-    """Detection Engine"""
-    # Example
-    if pps > 1000 and unique_dsts > 20:
-        return {
-            "anomaly": True,
-            "reason": f"High Rate: {pps} pps to {unique_dsts} unique IPs",
-        }
+        # TIER 2: SUPERVISED ML 
+        prediction = int(xgb_model.predict(feature_vector)[0])
 
-    return {"anomaly": False}
+        if prediction != 0:
+            class_mapping = {1: "DDoS Attack", 2: "Port Scan"}
+            return {
+                "anomaly": True,
+                "tier": "Tier 2 (XGBoost)",
+                "src_ip": window_features["src_ip"],
+                "type": class_mapping.get(prediction, "Known Attack"),
+                "metrics": f"{pps:.1f} pps"
+            }
+
+        # TIER 3: UNSUPERVISED DL
+        with torch.no_grad():
+            tensor_features = torch.tensor(feature_vector)
+            reconstructed = autoencoder_model(tensor_features)
+
+            # Calculate Reconstruction Error (Mean Squared Error)
+            loss = torch.mean((tensor_features - reconstructed) ** 2).item()
+
+        if loss > AE_THRESHOLD:
+            return {
+                "anomaly": True,
+                "tier": "Tier 3 (Autoencoder)",
+                "src_ip": window_features["src_ip"],
+                "type": "Potential Zero-Day Anomaly",
+                "metrics": f"Reconstruction loss: {loss:.2f}"
+            }
+
+        return {"anomaly": False}
+
+    except Exception as e:
+        return {"anomaly": False, "error": str(e)}
 
 
 class NetworkSlidingWindow:
@@ -104,11 +164,19 @@ class NetworkSlidingWindow:
 
 # Multi Process Packet Capture
 class AdvancedIDSPipeline:
-    def __init__(self, max_processes=4, window_secs=5):
+    def __init__(self, xgb_path="xgboost_ids.pkl", max_processes=4, window_secs=5):
         self.packet_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
         self.window = NetworkSlidingWindow(window_duration_secs=window_secs)
+
+        # TIER 1: DETERMINISTIC SIGNATURES
+        self.blocklisted_ips = {"192.168.1.50", "10.0.0.99"} # Example IPs 
+        self.restricted_ports = {23, 445} # Example ports 
+
+
         self.executor = ProcessPoolExecutor(
-            max_workers=max_processes, initializer=initialize_worker
+            max_workers=max_processes,
+            initializer=initialize_worker,
+            initargs=(xgb_path,)
         )
         self.sniffer = None
         self.processing_task = None
@@ -119,6 +187,14 @@ class AdvancedIDSPipeline:
             # # Convert Scapy to raw bytes to safely cross process boundaries.
             # packet_bytes = bytes(packet)
             # loop.call_soon_threadsafe(self.packet_queue.put_nowait, packet_bytes)
+
+            src, dst, dport = packet[IP].src, packet[IP].dst, packet[TCP].dport
+
+            # TIER 1 Checking
+            if src in self.blocklisted_ips or dport in self.restricted_ports:
+                print(f"[TIER 1 MATCH] Instant Drop -> IP: {src} or Port: {dport}")
+                return
+
 
             # New optimized version only requires the metadata for the sliding window.
             meta = {"src": packet[IP].src, "dst": packet[IP].dst, "len": len(packet)}
@@ -168,7 +244,7 @@ class AdvancedIDSPipeline:
 
     async def handle_alert(self, culprit_ip, alert_data):
         """Asynchronous alert handler running on the main thread."""
-        print(f"[!] IDS ALERT | Host: {culprit_ip} | Reason: {alert_data['reason']}")
+        print(f"[!] IDS [ALERT - {alert_data['tier']}] {alert_data['type]} | Host: {culprit_ip} | Reason: {alert_data['reason']}")
 
     async def stop(self):
         print("[*] Shutting down multi-process system...")
@@ -180,11 +256,11 @@ class AdvancedIDSPipeline:
 
         # Terminate and clean up background processes
         self.executor.shutdown(wait=True)
-        print("[*] System stopped cleanly.")
+        print("[*] IDS System Offline.")
 
 
 async def main():
-    capture = AdvancedIDSPipeline(max_processes=4, window_secs=5)
+    capture = AdvancedIDSPipeline(xgb_path="xgboost_ids.pkl", max_processes=4, window_secs=5)
     await capture.start_capture(interface="eth0")
     await asyncio.sleep(10)
     await capture.stop()
