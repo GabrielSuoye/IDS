@@ -1,6 +1,6 @@
 import asyncio
 import time
-import os 
+import os
 from collections import defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor
 from typing import Dict, Any
@@ -8,17 +8,17 @@ from scapy.all import AsyncSniffer, IP, TCP
 
 
 import joblib
-import numpy as np 
-import xgboost as xgb 
-import torch 
-import torch.nn as nn 
+import numpy as np
+import torch
+import torch.nn as nn
 
-# Global Models inside Worker Process 
+# Global Models inside Worker Process
 xgb_model = None
 autoencoder_model = None
-AE_THRESHOLD = 15.0    # Reconstruction error threshold for zero-days
+AE_THRESHOLD = 15.0  # Reconstruction error threshold for zero-days
 
-# PyTorch Autoencoder Structure 
+
+# PyTorch Autoencoder Structure
 class PacketAutoencoder(nn.Module):
     def __init__(self):
         super(PacketAutoencoder, self).__init__()
@@ -29,9 +29,13 @@ class PacketAutoencoder(nn.Module):
     def forward(self, x):
         return self.decoder(self.encoder(x))
 
+
 def initialize_worker():
     """Runs ONCE per CPU core to load both models into memory."""
     global xgb_model, autoencoder_model
+
+    base_dir = os.path.abspath(__file__)
+    xgb_path = os.path.join(base_dir, "data", "xgboost.joblib")
 
     # 1. Load Tier 2: XGBoost
     if os.path.exists(xgb_path):
@@ -41,40 +45,8 @@ def initialize_worker():
     # 2. Load Tier 3: PyTorch Autoencoder
     # In Production, load a trained weight file using torch.load()
     autoencoder_model = PacketAutoencoder()
-    autoencoder_model.eval() # Set to inference mode.
+    autoencoder_model.eval()  # Set to inference mode.
     print(f"[*] Core {os.getpid()}: Tier 3 Autoencoder initialized.")
-
-
-"""OLD Logic"""
-# def process_worker_logic(packet_bytes):
-#     """This handles CPU-BOUND heavy tasks and completely bypasses the Python GIL by having its own memomry space via running in an isolated CPU core/process"""
-#     try:
-#         # Reconstruct the Scapy packet from raw bytes.
-#         packet = Ether(packet_bytes)
-#
-#         if IP in packet and TCP in packet:
-#             # Feature extraction
-#             packet_size = len(packet)
-#             ttl = packet[IP].ttl
-#             tcp_flags = int(packet[TCP].flags)
-#
-#             # Anomaly Inference
-#             # features = [packet_size, ttl, tcp_flags]
-#             # prediction = my_ml_model.predict([features])
-#
-#             # Detection
-#             if packet_size > 1400:
-#                 return {
-#                     "anomaly": True,
-#                     "src": packet[IP].src,
-#                     "dst": packet[IP].dst,
-#                     "reason": "Large Packet Size",
-#                 }
-#
-#         return {"anomaly": False}
-#     except Exception as e:
-#         return {"anomaly": False, "error": str(e)}
-#
 
 
 def process_anomaly_inference(window_features):
@@ -90,8 +62,11 @@ def process_anomaly_inference(window_features):
         avg_len = window_features["avg_packet_len"]
         feature_vector = np.array([pps, unique_dsts, avg_len], dtype=np.float32)
 
-        # TIER 2: SUPERVISED ML 
-        prediction = int(xgb_model.predict(feature_vector)[0])
+        # TIER 2: SUPERVISED ML
+        if xgb_model is not None:
+            prediction = int(xgb_model.predict(feature_vector.reshape(1, -1))[0])
+        else:
+            raise RuntimeError("XGBoost model was not properly initialized.")
 
         if prediction != 0:
             class_mapping = {1: "DDoS Attack", 2: "Port Scan"}
@@ -100,7 +75,7 @@ def process_anomaly_inference(window_features):
                 "tier": "Tier 2 (XGBoost)",
                 "src_ip": window_features["src_ip"],
                 "type": class_mapping.get(prediction, "Known Attack"),
-                "metrics": f"{pps:.1f} pps"
+                "metrics": f"{pps:.1f} pps",
             }
 
         # TIER 3: UNSUPERVISED DL
@@ -117,7 +92,7 @@ def process_anomaly_inference(window_features):
                 "tier": "Tier 3 (Autoencoder)",
                 "src_ip": window_features["src_ip"],
                 "type": "Potential Zero-Day Anomaly",
-                "metrics": f"Reconstruction loss: {loss:.2f}"
+                "metrics": f"Reconstruction loss: {loss:.2f}",
             }
 
         return {"anomaly": False}
@@ -169,32 +144,24 @@ class AdvancedIDSPipeline:
         self.window = NetworkSlidingWindow(window_duration_secs=window_secs)
 
         # TIER 1: DETERMINISTIC SIGNATURES
-        self.blocklisted_ips = {"192.168.1.50", "10.0.0.99"} # Example IPs 
-        self.restricted_ports = {23, 445} # Example ports 
-
+        self.blocklisted_ips = {"192.168.1.50", "10.0.0.99"}  # Example IPs
+        self.restricted_ports = {23, 445}  # Example ports
 
         self.executor = ProcessPoolExecutor(
             max_workers=max_processes,
             initializer=initialize_worker,
-            initargs=(xgb_path,)
         )
         self.sniffer = None
         self.processing_task = None
 
     def packet_callback(self, packet):
         if IP in packet and TCP in packet:
-            # loop = asyncio.get_event_loop()
-            # # Convert Scapy to raw bytes to safely cross process boundaries.
-            # packet_bytes = bytes(packet)
-            # loop.call_soon_threadsafe(self.packet_queue.put_nowait, packet_bytes)
-
             src, dst, dport = packet[IP].src, packet[IP].dst, packet[TCP].dport
 
             # TIER 1 Checking
             if src in self.blocklisted_ips or dport in self.restricted_ports:
                 print(f"[TIER 1 MATCH] Instant Drop -> IP: {src} or Port: {dport}")
                 return
-
 
             # New optimized version only requires the metadata for the sliding window.
             meta = {"src": packet[IP].src, "dst": packet[IP].dst, "len": len(packet)}
@@ -211,14 +178,6 @@ class AdvancedIDSPipeline:
         loop = asyncio.get_running_loop()
         try:
             while True:
-                # Non-blocking pull of raw bytes from async queue
-                # packet_bytes = await self.packet_queue.get()
-
-                # Offload to an independent CPU core process
-                # result = await loop.run_in_executor(
-                #    self.executor, process_worker_logic, packet_bytes
-                # )
-
                 packet_meta = await self.packet_queue.get()
 
                 src = packet_meta["src"]
@@ -244,7 +203,9 @@ class AdvancedIDSPipeline:
 
     async def handle_alert(self, culprit_ip, alert_data):
         """Asynchronous alert handler running on the main thread."""
-        print(f"[!] IDS [ALERT - {alert_data['tier']}] {alert_data['type]} | Host: {culprit_ip} | Reason: {alert_data['reason']}")
+        print(
+            f"[!] IDS [ALERT - {alert_data['tier']}] {alert_data['type']} | Host: {culprit_ip} | Reason: {alert_data['reason']}"
+        )
 
     async def stop(self):
         print("[*] Shutting down multi-process system...")
@@ -260,7 +221,9 @@ class AdvancedIDSPipeline:
 
 
 async def main():
-    capture = AdvancedIDSPipeline(xgb_path="xgboost_ids.pkl", max_processes=4, window_secs=5)
+    capture = AdvancedIDSPipeline(
+        xgb_path="xgboost_ids.pkl", max_processes=4, window_secs=5
+    )
     await capture.start_capture(interface="eth0")
     await asyncio.sleep(10)
     await capture.stop()
