@@ -1,0 +1,12 @@
+version: "3.8"
+
+services:
+  ids-engine:
+    build: .
+    container_name: local-ids
+    restart: always
+    network_mode: "host"
+    environment:
+      - IDS_INTERFACE=eth0 # Change to your active network card (e.g., wlan0, en0)
+    volumes:
+      - ./logs:/app/logs
