@@ -186,7 +186,7 @@ class AdvancedIDSPipeline:
                 return
 
             # New optimized version only requires the metadata for the sliding window.
-            meta = {"src": packet[IP].src, "dst": packet[IP].dst, "len": len(packet)}
+            meta = {"src": src, "dst": dst, "len": len(packet)}
             loop = asyncio.get_event_loop()
             loop.call_soon_threadsafe(self.packet_queue.put_nowait, meta)
 
@@ -273,13 +273,18 @@ class AdvancedIDSPipeline:
 
 
 async def main():
-    capture = AdvancedIDSPipeline(
-        xgb_path="xgboost_ids.pkl", max_processes=4, window_secs=5
-    )
-    await capture.start_capture(interface="eth0")
-    await asyncio.sleep(10)
-    await capture.stop()
+    interface = os.environ.get("IDS_INTERFACE", "eth0")
+
+    capture = AdvancedIDSPipeline(max_processes=4, window_secs=5)
+    await capture.start_capture(interface=interface)
+
+    # Run indefinitely until manually stopped via Docker
+    while True:
+        await asyncio.sleep(3600)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("IDS manually terminated.")
