@@ -1,16 +1,17 @@
 import asyncio
 import time
+import json
 import os
 from collections import defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor
-from typing import Dict, Any
+from typing import Any
 from scapy.all import AsyncSniffer, IP, TCP
 
 
 import joblib
 import numpy as np
 import torch
-import torch.nn as nn
+from torch import nn
 
 # Global Models inside Worker Process
 xgb_model = None
@@ -21,7 +22,7 @@ AE_THRESHOLD = 15.0  # Reconstruction error threshold for zero-days
 # PyTorch Autoencoder Structure
 class PacketAutoencoder(nn.Module):
     def __init__(self):
-        super(PacketAutoencoder, self).__init__()
+        super().__init__()
         # Compress 3 features down to 1 bottleneck layer, then rebuild them.
         self.encoder = nn.Sequential(nn.Linear(3, 2), nn.ReLU(), nn.Linear(2, 1))
         self.decoder = nn.Sequential(nn.Linear(1, 2), nn.ReLU(), nn.Linear(2, 3))
@@ -34,7 +35,7 @@ def initialize_worker():
     """Runs ONCE per CPU core to load both models into memory."""
     global xgb_model, autoencoder_model
 
-    base_dir = os.path.abspath(__file__)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
     xgb_path = os.path.join(base_dir, "data", "xgboost.joblib")
 
     # 1. Load Tier 2: XGBoost
@@ -54,7 +55,6 @@ def process_anomaly_inference(window_features):
     TIER 2 & 3 ENGINES: Runs on completely isolated CPU cores.
     Performs a conditional cascade fallback.
     """
-    global xgb_model, autoencoder_model
     # Unpack the metrics prepared by the sliding window
     try:
         pps = window_features["packets_per_sec"]
@@ -81,6 +81,9 @@ def process_anomaly_inference(window_features):
         # TIER 3: UNSUPERVISED DL
         with torch.no_grad():
             tensor_features = torch.tensor(feature_vector)
+            if autoencoder_model is None:
+                raise RuntimeError("Autoencoder model was not properly initialized.")
+
             reconstructed = autoencoder_model(tensor_features)
 
             # Calculate Reconstruction Error (Mean Squared Error)
@@ -97,7 +100,7 @@ def process_anomaly_inference(window_features):
 
         return {"anomaly": False}
 
-    except Exception as e:
+    except (RuntimeError, ValueError) as e:
         return {"anomaly": False, "error": str(e)}
 
 
@@ -127,7 +130,7 @@ class NetworkSlidingWindow:
 
         total_packets = len(packets)
         total_len = sum(p[1] for p in packets)
-        unique_dsts = len(set(p[2] for p in packets))
+        unique_dsts = len({(p[2] for p in packets)})
 
         return {
             "src_ip": src_ip,
@@ -139,9 +142,17 @@ class NetworkSlidingWindow:
 
 # Multi Process Packet Capture
 class AdvancedIDSPipeline:
-    def __init__(self, xgb_path="xgboost_ids.pkl", max_processes=4, window_secs=5):
-        self.packet_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
+    def __init__(
+        self,
+        log_file="ids_alerts.jsonl",
+        max_processes=4,
+        window_secs=5,
+    ):
+        self.packet_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self.window = NetworkSlidingWindow(window_duration_secs=window_secs)
+
+        # Log Configuration
+        self.log_file = log_file
 
         # TIER 1: DETERMINISTIC SIGNATURES
         self.blocklisted_ips = {"192.168.1.50", "10.0.0.99"}  # Example IPs
@@ -160,13 +171,44 @@ class AdvancedIDSPipeline:
 
             # TIER 1 Checking
             if src in self.blocklisted_ips or dport in self.restricted_ports:
-                print(f"[TIER 1 MATCH] Instant Drop -> IP: {src} or Port: {dport}")
+                # Trigger a non-blocking asynchronous log via thread safe loop tracking
+                alert_payload = {
+                    "timestamp": time.time(),
+                    "tier": "Tier 1 (Deterministic)",
+                    "type": "Blocklisted IP or Restricted Port Access Attempt",
+                    "src_ip": src,
+                    "metrics": f"Target Port: {dport}",
+                }
+                loop = asyncio.get_event_loop()
+                loop.call_soon_threadsafe(
+                    asyncio.create_task, self._write_log_async(alert_payload)
+                )
                 return
 
             # New optimized version only requires the metadata for the sliding window.
             meta = {"src": packet[IP].src, "dst": packet[IP].dst, "len": len(packet)}
             loop = asyncio.get_event_loop()
             loop.call_soon_threadsafe(self.packet_queue.put_nowait, meta)
+
+    async def _write_log_async(self, alert_data):
+        """
+        Asynchronously writes the log to disk.
+        Utilizes non-blocking execution so file I/O latency never bavks up the sniffer.
+        """
+        log_line = json.dumps(alert_data) + "\n"
+
+        try:
+            import aiofiles
+
+            async with aiofiles.open(self.log_file, "a") as f:
+                await f.write(log_line)
+        except ImportError:
+
+            def sync_append():
+                with open(self.log_file, "a") as f:
+                    f.write(log_line)
+
+            await asyncio.to_thread(sync_append)
 
     async def start_capture(self, interface="eth0"):
         print(f"[*] Starting Multi-Process capture on {interface}...")
@@ -203,9 +245,19 @@ class AdvancedIDSPipeline:
 
     async def handle_alert(self, culprit_ip, alert_data):
         """Asynchronous alert handler running on the main thread."""
+        alert_payload = {
+            "timestamp": time.time(),
+            "tier": alert_data["tier"],
+            "type": alert_data["type"],
+            "src_ip": alert_data["src_ip"],
+            "metrics": alert_data["metrics"],
+        }
+
         print(
             f"[!] IDS [ALERT - {alert_data['tier']}] {alert_data['type']} | Host: {culprit_ip} | Reason: {alert_data['reason']}"
         )
+
+        asyncio.create_task(self._write_log_async(alert_payload))
 
     async def stop(self):
         print("[*] Shutting down multi-process system...")
