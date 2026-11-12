@@ -37,6 +37,7 @@ def initialize_worker():
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
     xgb_path = os.path.join(base_dir, "data", "xgboost.joblib")
+    autoencoder_path = os.path.join(base_dir, "data", "autoencoder.joblib")
 
     # 1. Load Tier 2: XGBoost
     if os.path.exists(xgb_path):
@@ -46,8 +47,14 @@ def initialize_worker():
     # 2. Load Tier 3: PyTorch Autoencoder
     # In Production, load a trained weight file using torch.load()
     autoencoder_model = PacketAutoencoder()
+    if os.path.exists(autoencoder_path):
+        autoencoder_model.load_state_dict(
+            torch.load(autoencoder_path, weights_only=True)
+        )
+        print(
+            f"[*] Core {os.getpid()}: Tier 3 Autoencoder weights loaded successfully."
+        )
     autoencoder_model.eval()  # Set to inference mode.
-    print(f"[*] Core {os.getpid()}: Tier 3 Autoencoder initialized.")
 
 
 def process_anomaly_inference(window_features):
